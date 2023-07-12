@@ -4,14 +4,14 @@ import logging
 
 import jupyter_client
 
-# Note:
-# The goals of this implementation are
-# 1. robust
-# 2. easy to read and self contained (no dependency on ACE)
-#
-# Currently, this implementation is used for health check.
-# Unlike ace_client/code_executor.py, this implementation works directly against jupyter_client API, not via ace_requests.
-# Additionally, this implementation correctly handles kernel death, which is critical for the health check use case.
+       
+                                      
+           
+                                                           
+ 
+                                                          
+                                                                                                                          
+                                                                                                                    
 
 logger = logging.getLogger(__name__)
 

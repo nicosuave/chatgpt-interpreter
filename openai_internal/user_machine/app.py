@@ -6,22 +6,26 @@ import os
 import sys
 import time
 import traceback
+import urllib.parse
 import uuid
 
 import traitlets
 from ace_client.ace_types.user_machine_types import *
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from jupyter_client import AsyncKernelClient, AsyncKernelManager, AsyncMultiKernelManager
 from pydantic import parse_obj_as
-from quart import (
-    Quart,
-    abort,
-    copy_current_websocket_context,
-    jsonify,
-    make_response,
-    request,
-    send_from_directory,
-    websocket,
-)
 
 from . import routes, run_jupyter
 
@@ -36,22 +40,23 @@ logging.basicConfig(
 os.chdir(os.path.expanduser("~"))
 
 _MAX_UPLOAD_SIZE = 1024 * 1024 * 1024
+_MAX_DOWNLOAD_TIME = 5 * 60.0
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024       
 _MAX_JUPYTER_MESSAGE_SIZE = 10 * 1024 * 1024
 _MAX_KERNELS = 20
 
-app = Quart(__name__)
-app.config["MAX_CONTENT_LENGTH"] = _MAX_UPLOAD_SIZE
+app = FastAPI()
 
 jupyter_config = traitlets.config.get_config()
-# Don't set c.KernelManager.autorestart to False because doing so will
-# disable the add_restart_callback mechanism, which we depend on to
-# detect kernel deaths.
-# Set c.KernelRestarter.restart_limit to 0 so that the kernel will not
-# attempt to restart if the kernel process dies unexpectedly.
+                                                                      
+                                                                   
+                       
+                                                                      
+                                                             
 jupyter_config.KernelRestarter.restart_limit = 0
 _MULTI_KERNEL_MANAGER = AsyncMultiKernelManager(config=jupyter_config)
 
-_response_to_callback_from_kernel_futures = {}
+_response_to_callback_from_kernel_futures: Dict[str, asyncio.Future] = {}
 
 _timeout_at = {}
 _timeout = {}
@@ -61,7 +66,13 @@ _kernel_queue = None
 _fill_kernel_queue_task = None
 _first_kernel_started = False
 
-# kickoff a background job that will kill any kernels that have been running for too long
+_SELF_IDENTIFY_HEADER_KEY = "x-ace-self-identify"
+_SELF_IDENTIFY_HEADER_KEY_BYTES = b"x-ace-self-identify"
+_SELF_IDENTIFY_STR = os.getenv("ACE_SELF_IDENTIFY")
+_SELF_IDENTIFY_BYTES = os.getenv("ACE_SELF_IDENTIFY").encode("utf-8")
+
+
+                                                                                         
 async def _kill_old_kernels():
     while True:
         await asyncio.sleep(2.0)
@@ -76,12 +87,12 @@ async def _kill_old_kernels():
 async def _fill_kernel_queue():
     global _first_kernel_started, _kernel_queue
     try:
-        # With a maxsize of 1, we effectively have two warmed-up kernels:
-        # one in the queue, another blocked on queue.put call.
+                                                                         
+                                                              
         _kernel_queue = asyncio.Queue(maxsize=1)
-        # Prepare a single kernel a head of time, pull a future off of the queue and
-        # assign it to that kernel. This way, we can avoid the overhead of starting
-        # a new kernel for evdery request.
+                                                                                    
+                                                                                   
+                                          
         kernel_id = None
         kernel_manager = None
         while True:
@@ -89,7 +100,9 @@ async def _fill_kernel_queue():
             if len(_timeout_at.keys()) >= _MAX_KERNELS:
                 logger.info(f"Too many kernels ({_MAX_KERNELS}). Deleting oldest kernel.")
                 sort_key = lambda kernel_id: _timeout_at[kernel_id]
-                kernels_to_delete = sorted(_timeout_at.keys(), key=sort_key, reverse=True)[_MAX_KERNELS - 1 :]
+                kernels_to_delete = sorted(_timeout_at.keys(), key=sort_key, reverse=True)[
+                    _MAX_KERNELS - 1 :
+                ]
                 for kernel_id in kernels_to_delete:
                     logger.info(f"Deleting kernel {kernel_id}")
                     await _delete_kernel(kernel_id)
@@ -106,8 +119,12 @@ async def _fill_kernel_queue():
             del client
 
             end_time = time.monotonic()
-            logger.info(f"Create new kernel for pool: Done making new kernel in {end_time - start_time:.3f} seconds")
-            logger.info(f"Create new kernel for pool: New kernel id {kernel_id} in {id(_kernel_queue)}")
+            logger.info(
+                f"Create new kernel for pool: Done making new kernel in {end_time - start_time:.3f} seconds"
+            )
+            logger.info(
+                f"Create new kernel for pool: New kernel id {kernel_id} in {id(_kernel_queue)}"
+            )
 
             _first_kernel_started = True
             await _kernel_queue.put(kernel_id)
@@ -126,68 +143,52 @@ async def _delete_kernel(kernel_id):
     del _timeout[kernel_id]
 
 
-@app.before_serving
+@app.on_event("startup")
 async def startup():
     global _timeout_task, _fill_kernel_queue_task
     _timeout_task = asyncio.create_task(_kill_old_kernels())
     _fill_kernel_queue_task = asyncio.create_task(_fill_kernel_queue())
 
 
-@app.after_serving
+@app.on_event("shutdown")
 async def shutdown():
-    _timeout_task.cancel()  # type: ignore
-    _fill_kernel_queue_task.cancel()  # type: ignore
+    _timeout_task.cancel()                
+    _fill_kernel_queue_task.cancel()                
 
 
-async def _SEND_CALLBACK_REQUEST(name, **kwargs):
+async def _SEND_CALLBACK_REQUEST(call: MethodCall):
     raise NotImplementedError()
 
 
-async def _forward_callback_from_kernel(name):
-    if request.remote_addr != "127.0.0.1":
-        abort(403)
-    request_id = str(uuid.uuid4())
-    call = MethodCall(
-        request_id=request_id,
-        object_reference=ObjectReference(type="callbacks", id=""),
-        method=name,
-        args=[],
-        kwargs=request.args,
-    )
+def _is_from_localhost(request: Request) -> bool:
+    return request.client.host == "127.0.0.1"
+
+
+async def _forward_callback_from_kernel(call: MethodCall, request: Request):
+    if not _is_from_localhost(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     logger.info(f"Forwarding callback request from kernel. {call}")
-    _response_to_callback_from_kernel_futures[request_id] = asyncio.Future()
-    await _SEND_CALLBACK_REQUEST(call.json())
-    response = await _response_to_callback_from_kernel_futures[request_id]
-    logger.info(f"Forwarding callback response to kernel: {response}.")
-    del _response_to_callback_from_kernel_futures[request_id]
-    return jsonify({"value": response})
+    _response_to_callback_from_kernel_futures[call.request_id] = asyncio.Future()
+    await _SEND_CALLBACK_REQUEST(call)
+
+    response = await _response_to_callback_from_kernel_futures[call.request_id]
+    logger.info(f"Forwarding callback response to kernel: {call.request_id}.")
+    del _response_to_callback_from_kernel_futures[call.request_id]
+    return JSONResponse({"value": response})
 
 
-app.register_blueprint(routes.get_blueprint(_forward_callback_from_kernel), url_prefix="/")
+app.include_router(routes.get_api_router(_forward_callback_from_kernel), prefix="")
 
 
-def _respond_to_callback_from_kernel(response):
+def _respond_to_callback_from_kernel(response: MethodCallReturnValue):
     logger.info("Received callback response.")
     _response_to_callback_from_kernel_futures[response.request_id].set_result(response.value)
 
 
-async def _send(response):
-    message = response.json()
-    logger.info(f"Sending response: {type(response)}, {len(message)}")
-    if len(message) > _MAX_JUPYTER_MESSAGE_SIZE:
-        raise UserMachineResponseTooLarge(
-            f"Message of type {type(response)} is too large: {len(message)}"
-        )
-    await websocket.send(message)
-    logger.info("Response sent.")
-
-
-@app.route("/check_liveness", methods=["GET"])
+@app.get("/check_liveness")
 async def check_liveness():
-    code = """
-    print(f'{400+56}')
-    100+23
-    """
+    code = "print(f'{400+56}')\n100+23\n"
     logger.info("Health check: running...")
     start_time = time.monotonic()
     kernel_id = await _create_kernel(timeout=30.0)
@@ -215,48 +216,85 @@ async def check_liveness():
         await _delete_kernel(kernel_id)
     end_time = time.monotonic()
     logger.info(f"Health check took {end_time - start_time} seconds and returned {result}")
-    return await make_response(jsonify(result), status_code)
+    return JSONResponse(content=result, status_code=status_code)
 
 
-@app.route("/check_startup", methods=["GET"])
+@app.get("/check_startup")
 async def check_startup():
     if not _first_kernel_started:
         logger.info("Failed health check")
-        return await make_response(
-            jsonify({"status": "failed", "reason": "kernel queue is not initialized"}), 500
+        return JSONResponse(
+            content={"status": "failed", "reason": "kernel queue is not initialized"},
+            status_code=500,
         )
     logger.info("Passed health check")
-    return await make_response(jsonify({"status": "started"}))
+    return JSONResponse(content={"status": "started"})
 
 
-@app.route("/upload", methods=["POST"])
-async def upload():
+@app.post("/upload")
+async def upload(upload_request: str = Form(), file: UploadFile = File()):
     logger.info("Upload request")
-    upload_file_request = parse_obj_as(
-        UploadFileRequest, json.loads((await request.form)["upload_request"])
-    )
-    file = (await request.files)["file"]
-    await file.save(upload_file_request.destination)
-    logger.info(f"Upload request complete. {upload_file_request}")
-    return jsonify({})
+    request = parse_obj_as(UploadFileRequest, json.loads(upload_request))
+    try:
+        total_size = 0
+        with open(request.destination, "wb") as f:
+            while chunk := file.file.read():
+                total_size += len(chunk)
+                if total_size > _MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="File too large",
+                    )
+                f.write(chunk)
+    except Exception:
+        try:
+            os.remove(request.destination)
+        except Exception as e:
+            logger.exception(f"Error while removing file: {request.destination}", exc_info=e)
+        raise
+
+    logger.info(f"Upload request complete. {upload_request}")
+    return JSONResponse(content={})
 
 
-@app.route("/download/<path:path>", methods=["GET"])
-async def download(path):
+@app.get("/download/{path:path}")
+async def download(path: str):
+    path = urllib.parse.unquote(path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"File not found: {path}")
+
     logger.info(f"Download request. {path}")
-    response = await make_response(await send_from_directory("/", path))
-    return response
+
+    def iterfile():
+        with open(path, "rb") as f:
+            while chunk := f.read(_DOWNLOAD_CHUNK_SIZE):
+                yield chunk
+
+    return StreamingResponse(
+        iterfile(),
+        headers={"Content-Length": f"{os.path.getsize(path)}"},
+        media_type="application/octet-stream",
+    )
 
 
-@app.route("/check_file/<path:path>", methods=["GET"])
-async def check_file(path):
-    path = "/" + path
+@app.get("/check_file/{path:path}")
+async def check_file(path: str):
+    path = "/" + urllib.parse.unquote(path)
     logger.info(f"Check file request. {path}")
     exists = os.path.isfile(path)
     size = os.path.getsize(path) if exists else 0
-    response = CheckFileResponse(exists=exists, size=size, too_large=False)
-    response = await make_response(jsonify(response.dict()))
-    return response
+    return CheckFileResponse(exists=exists, size=size, too_large=False)
+
+
+@app.get("/kernel/{kernel_id}")
+async def kernel_state(kernel_id: str):
+    logger.info(f"Get kernel state request. {kernel_id}")
+    if kernel_id not in _timeout_at:
+        time_remaining_ms = 0.0
+    else:
+        time_remaining_ms = max(0.0, _timeout_at[kernel_id] - time.monotonic()) * 1000.0
+
+    return GetKernelStateResponse(time_remaining_ms=time_remaining_ms)
 
 
 async def _create_kernel(timeout: float):
@@ -267,36 +305,36 @@ async def _create_kernel(timeout: float):
     return kernel_id
 
 
-@app.route("/kernel", methods=["POST"])
-async def create_kernel():
-    create_kernel_request = parse_obj_as(CreateKernelRequest, await request.get_json())
+@app.post("/kernel")
+async def create_kernel(create_kernel_request: CreateKernelRequest):
     logger.info(f"Create kernel request. {create_kernel_request}")
     timeout = create_kernel_request.timeout
     kernel_id = await _create_kernel(timeout=timeout)
     logger.info(f"Got kernel id from queue. {create_kernel_request}")
-    return jsonify(CreateKernelResponse(kernel_id=kernel_id).dict())
+    return CreateKernelResponse(kernel_id=kernel_id)
 
 
 @app.websocket("/channel")
-async def channel():
-    @copy_current_websocket_context
-    async def send_callback_request(json):
-        await websocket.send(json)
+async def channel(websocket: WebSocket):
+    async def send_callback_request(call: MethodCall):
+        await websocket.send_text(call.json())
 
     logger.info("Setting global forward function.")
     global _SEND_CALLBACK_REQUEST
     _SEND_CALLBACK_REQUEST = send_callback_request
 
-    clients = {}
-    # There are 3 sources of messages:
-    # 1. The API server: proxied requests from the user machine
-    # 2. The Jupyter client: return value of async Jupyter client invocations
-    # 3. The kernel (user code): callback requests via http
-    # The first two maps to the two following variables. The third is handled by
-    # the send_callback_request function.
-    #
-    # Similarly, there are also 3 corresponding sinks of messages.
-    recv_from_api_server = asyncio.create_task(websocket.receive())
+    await websocket.accept(headers=[(_SELF_IDENTIFY_HEADER_KEY_BYTES, _SELF_IDENTIFY_BYTES)])
+
+    clients: Dict[str, AsyncKernelClient] = {}
+                                      
+                                                               
+                                                                             
+                                                           
+                                                                                
+                                         
+     
+                                                                  
+    recv_from_api_server = asyncio.create_task(websocket.receive_text())
     recv_from_jupyter = None
     try:
         while True:
@@ -308,7 +346,7 @@ async def channel():
             logger.info(f"Got messages for {done}.")
             if recv_from_api_server in done:
                 done_future = recv_from_api_server
-                recv_from_api_server = asyncio.create_task(websocket.receive())
+                recv_from_api_server = asyncio.create_task(websocket.receive_text())
                 request = parse_obj_as(UserMachineRequest, json.loads(done_future.result()))
                 logger.info(f"Received message from API server. {request}")
                 if isinstance(request, RegisterActivityRequest):
@@ -318,7 +356,7 @@ async def channel():
                     _respond_to_callback_from_kernel(request)
                 elif isinstance(request, MethodCall):
 
-                    async def run(request):
+                    async def run(request: UserMachineRequest):
                         try:
                             object_reference = request.object_reference
                             if object_reference.type == "multi_kernel_manager":
@@ -333,8 +371,9 @@ async def channel():
                                 raise Exception(
                                     f"Unknown object reference type: {object_reference.type}"
                                 )
+                            qualified_method = f"{object_reference.type}.{request.method}"
                             logger.info(
-                                f"Method call: {request.method} args: {request.args} kwargs: {request.kwargs}"
+                                f"Method call: {qualified_method} args: {request.args} kwargs: {request.kwargs}"
                             )
                             value = getattr(referenced_object, request.method)(
                                 *request.args, **request.kwargs
@@ -377,12 +416,55 @@ async def channel():
                         value=str(e),
                         traceback=traceback.format_tb(e.__traceback__),
                     )
-                    # Drop reference to e because traceback may hold onto a lot of memory
+                                                                                         
                     del e
-                await _send(result)
-    except asyncio.CancelledError:
-        logger.info("Websocket closed.")
+
+                                           
+                message = result.json()
+                logger.info(f"Sending response: {type(result)}, {len(message)}")
+                if len(message) > _MAX_JUPYTER_MESSAGE_SIZE:
+                    logger.error(f"Response too large: {len(message)}")
+                    e = UserMachineResponseTooLarge(
+                        f"Message of type {type(result)} is too large: {len(message)}"
+                    )
+                    message = MethodCallException(
+                        request_id=result.request_id,
+                        type=type(e).__name__,
+                        value=str(e),
+                        traceback=traceback.format_tb(e.__traceback__),
+                    ).json()
+
+                await websocket.send_text(message)
+                logger.info("Response sent.")
+    except WebSocketDisconnect as e:
+        if e.code == 1000:
+            logger.info("Client WebSocket connection closed normally")
+        else:
+            logger.exception(f"Client WebSocket connection closed with code {e.code}")
         for client in clients.values():
             client.stop_channels()
         logger.info("All clients stopped.")
         return
+
+
+@app.middleware("http")
+async def add_self_identify_header(request: Request, call_next):
+                                                                                                  
+    if _is_from_localhost(request):
+                                                                                                  
+        return await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+                                                                                     
+                                                                                      
+                                                                                 
+                                    
+        traceback.print_exc()
+        return PlainTextResponse(
+            "Internal server error",
+            status_code=500,
+            headers={_SELF_IDENTIFY_HEADER_KEY: _SELF_IDENTIFY_STR},
+        )
+    response.headers[_SELF_IDENTIFY_HEADER_KEY] = _SELF_IDENTIFY_STR
+    return response

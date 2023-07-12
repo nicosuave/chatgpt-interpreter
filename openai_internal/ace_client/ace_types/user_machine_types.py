@@ -13,12 +13,13 @@ class ObjectReference(pydantic.BaseModel):
     id: str
 
 
-class MethodCall(pydantic.BaseModel):
+class MethodCall(pydantic.BaseModel):                          
     message_type: Literal["call_request"] = "call_request"
     object_reference: ObjectReference
     request_id: str
     method: str
     args: List[Any]
+                                                                                          
     kwargs: Dict[str, Any]
 
 
@@ -47,11 +48,26 @@ class UploadFileRequest(pydantic.BaseModel):
     destination: str
 
 
+class UploadFileFromUrlRequest(pydantic.BaseModel):
+    message_type: Literal["upload_file_from_url_request"] = "upload_file_from_url_request"
+    source_url: str
+    destination: str
+
+
+class DownloadFileToUrlRequest(pydantic.BaseModel):
+    message_type: Literal["download_file_to_url_request"] = "download_file_to_url_request"
+    source: str
+    destination_url: str
+
+
 class CheckFileResponse(pydantic.BaseModel):
     message_type: Literal["check_file_response"] = "check_file_response"
+                                                                           
+                             
     exists: bool
     too_large: bool
     size: int
+    user_machine_exists: bool = True
 
 
 class CreateKernelRequest(pydantic.BaseModel):
@@ -63,6 +79,11 @@ class CreateKernelRequest(pydantic.BaseModel):
 class CreateKernelResponse(pydantic.BaseModel):
     message_type: Literal["create_kernel_response"] = "create_kernel_response"
     kernel_id: str
+
+
+class GetKernelStateResponse(pydantic.BaseModel):
+    message_type: Literal["get_kernel_state_response"] = "get_kernel_state_response"
+    time_remaining_ms: float
 
 
 class RegisterActivityRequest(pydantic.BaseModel):
